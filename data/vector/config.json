@@ -1,0 +1,17 @@
+{
+  "model_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "content_col": "article_content",
+  "gender_col": "gender",
+  "num_documents": 1982,
+  "embedding_shape": [
+    1982,
+    384
+  ],
+  "files": {
+    "metadata": "metadata.csv",
+    "sbert_embeddings": "sbert_embeddings.npy",
+    "bm25_index": "bm25_index.pkl",
+    "jieba_tokenized_corpus": "jieba_tokenized_corpus.pkl"
+  },
+  "notes": "metadata.doc_id 對應 embeddings 的 row index，也對應 BM25 corpus 的文件順序。"
+}
