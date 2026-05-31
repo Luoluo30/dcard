@@ -2,9 +2,9 @@
   "model_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
   "content_col": "article_content",
   "gender_col": "gender",
-  "num_documents": 1982,
+  "num_documents": 3038,
   "embedding_shape": [
-    1982,
+    3038,
     384
   ],
   "files": {
