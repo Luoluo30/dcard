@@ -15,10 +15,6 @@ build/
 venv/
 env/
 
-# Data & models (large files)
-data/vector/sbert_embeddings.npy
-data/vector/bm25_index.pkl
-data/vector/jieba_tokenized_corpus.pkl
 
 # OS
 .DS_Store
