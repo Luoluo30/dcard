@@ -28,7 +28,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from autogen import AssistantAgent, LLMConfig, UserProxyAgent
 from autogen.code_utils import content_str
-from sympy import content
 
 
 AGENT_AVATARS = {"User": "👤", "Assistant": "🤖"}

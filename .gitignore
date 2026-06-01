@@ -1,0 +1,29 @@
+# API Keys & secrets
+.env
+.env.*
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Data & models (large files)
+data/vector/sbert_embeddings.npy
+data/vector/bm25_index.pkl
+data/vector/jieba_tokenized_corpus.pkl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
