@@ -1,8 +1,11 @@
 1. 環境變數設定
-請在專案根目錄建立一個 .env 檔案，並填入你的 API 金鑰：
+請在專案根目錄建立一個 .env 檔案，並填入你的 API 金鑰與 Neo4j 連線設定：
 
 ```bash
 GOOGLE_GEMINI_API_KEY=你的api_key
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=你的密碼
 ```
 
 2. 安裝套件

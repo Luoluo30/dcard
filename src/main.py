@@ -11,6 +11,7 @@ GOOGLE_GEMINI_API_KEY=你的 Gemini API Key
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import pickle
@@ -22,12 +23,14 @@ import jieba
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 from autogen import AssistantAgent, LLMConfig, UserProxyAgent
 from autogen.code_utils import content_str
+from neo4j_utils import get_neo4j_driver, query_articles_by_topic
 
 
 AGENT_AVATARS = {"User": "👤", "Assistant": "🤖"}
@@ -170,6 +173,11 @@ def load_ag2_agent(gemini_model: str, lang_setting: str):
     )
 
     return assistant, user_proxy
+
+
+@st.cache_resource(show_spinner="初始化 Neo4j 連線中...")
+def load_neo4j_driver():
+    return get_neo4j_driver()
 
 
 def tokenize_zh(text: str) -> List[str]:
@@ -332,6 +340,249 @@ def result_table(metadata: pd.DataFrame, results: List[SearchResult], content_co
     return pd.DataFrame(rows)
 
 
+def _short_text(value: object, max_len: int = 42) -> str:
+    text = str(value or "")
+    text = text.replace("\n", " ").replace("\r", " ").strip()
+    if len(text) > max_len:
+        text = text[: max_len - 1] + "…"
+    return text
+
+
+def neo4j_result_table(rows: List[Dict[str, object]]) -> pd.DataFrame:
+    def as_list(value: object) -> List[object]:
+        return value if isinstance(value, list) else []
+
+    def similar_text(items: object) -> str:
+        if not isinstance(items, list):
+            return ""
+        labels = []
+        for item in items:
+            if not isinstance(item, dict) or item.get("doc_id") is None:
+                continue
+            labels.append(f"#{item.get('doc_id')} ({item.get('score', '')})")
+        return ", ".join(labels)
+
+    def reason_text(row: Dict[str, object]) -> str:
+        topics = as_list(row.get("topics"))
+        topic_part = "、".join(str(t) for t in topics[:3])
+        similar_part = similar_text(row.get("similar_articles"))
+        parts = []
+        if topic_part:
+            parts.append(f"主題連結：{topic_part}")
+        if similar_part:
+            parts.append(f"相似文章：{similar_part}")
+        return "；".join(parts)
+
+    return pd.DataFrame(
+        [
+            {
+                "doc_id": row.get("doc_id"),
+                "title": row.get("title", ""),
+                "gender": row.get("gender", ""),
+                "topics": "、".join(str(t) for t in as_list(row.get("topics"))[:5]),
+                "similar_articles": similar_text(row.get("similar_articles")),
+                "recommendation_reason": reason_text(row),
+                "url": row.get("url", ""),
+            }
+            for row in rows
+        ]
+    )
+
+
+def build_neo4j_graph_html(topic: str, rows: List[Dict[str, object]]) -> str:
+    visible_rows = rows[:10]
+    height = max(420, min(900, 150 + len(visible_rows) * 86))
+    query_x = 85
+    topic_x = 270
+    article_x = 495
+    similar_x = 725
+    gender_x = 890
+    query_y = height // 2
+    article_gap = max(62, min(86, (height - 140) // max(1, len(visible_rows) - 1 or 1)))
+    article_start_y = query_y - article_gap * (len(visible_rows) - 1) // 2
+
+    topic_names = []
+    for row in visible_rows:
+        row_topics = row.get("topics")
+        row_topics = row_topics if isinstance(row_topics, list) else []
+        for topic_name in row_topics[:2]:
+            if topic_name and topic_name not in topic_names:
+                topic_names.append(str(topic_name))
+    topic_names = topic_names[:8]
+    topic_positions = {
+        name: int((index + 1) * height / (len(topic_names) + 1))
+        for index, name in enumerate(topic_names)
+    }
+
+    genders = sorted({str(row.get("gender", "") or "unknown") for row in visible_rows})
+    gender_positions = {
+        gender: int((index + 1) * height / (len(genders) + 1))
+        for index, gender in enumerate(genders)
+    }
+
+    edges = []
+    article_nodes = []
+    similar_nodes = []
+    for index, row in enumerate(visible_rows):
+        y = article_start_y + index * article_gap
+        gender = str(row.get("gender", "") or "unknown")
+        gender_y = gender_positions[gender]
+
+        raw_topics = row.get("topics")
+        raw_topics = raw_topics if isinstance(raw_topics, list) else []
+        row_topics = [str(t) for t in raw_topics[:2] if str(t) in topic_positions]
+        if row_topics:
+            for topic_name in row_topics:
+                topic_y = topic_positions[topic_name]
+                edges.append(
+                    f'<path class="edge-topic" d="M {query_x + 58} {query_y} C 155 {query_y}, 170 {topic_y}, {topic_x - 76} {topic_y}" />'
+                )
+                edges.append(
+                    f'<path class="edge-topic" d="M {topic_x + 76} {topic_y} C 360 {topic_y}, 360 {y}, {article_x - 135} {y}" />'
+                )
+        else:
+            edges.append(
+                f'<path d="M {query_x + 58} {query_y} C 245 {query_y}, 330 {y}, {article_x - 135} {y}" />'
+            )
+
+        edges.append(
+            f'<path class="edge-gender" d="M {article_x + 135} {y} C 685 {y}, 725 {gender_y}, {gender_x - 72} {gender_y}" />'
+        )
+        raw_similar = row.get("similar_articles")
+        raw_similar = raw_similar if isinstance(raw_similar, list) else []
+        similar_items = [
+            item for item in raw_similar
+            if isinstance(item, dict) and item.get("doc_id") is not None
+        ][:1]
+        if similar_items:
+            similar = similar_items[0]
+            similar_y = min(height - 38, max(38, y + 34))
+            edges.append(
+                f'<path class="edge-similar" d="M {article_x + 135} {y} C 620 {y}, 635 {similar_y}, {similar_x - 82} {similar_y}" />'
+            )
+            similar_nodes.append(
+                f"""
+                <g class="node similar" transform="translate({similar_x},{similar_y})">
+                  <rect x="-82" y="-22" width="164" height="44" rx="10"></rect>
+                  <text class="label-main" y="-3">Similar #{html.escape(str(similar.get("doc_id", "")))}</text>
+                  <text class="label-sub" y="14">score {html.escape(str(similar.get("score", "")))}</text>
+                </g>
+                """
+            )
+
+        article_nodes.append(
+            f"""
+            <g class="node article" transform="translate({article_x},{y})">
+              <rect x="-135" y="-27" width="270" height="54" rx="11"></rect>
+              <text class="label-main" y="-5">Article #{html.escape(str(row.get("doc_id", "")))}</text>
+              <text class="label-sub" y="14">{html.escape(_short_text(row.get("title", ""), 31))}</text>
+            </g>
+            """
+        )
+
+    topic_nodes = [
+        f"""
+        <g class="node topic" transform="translate({topic_x},{y})">
+          <rect x="-76" y="-24" width="152" height="48" rx="11"></rect>
+          <text class="label-main" y="-3">Topic</text>
+          <text class="label-sub" y="15">{html.escape(_short_text(name, 16))}</text>
+        </g>
+        """
+        for name, y in topic_positions.items()
+    ]
+
+    gender_nodes = [
+        f"""
+        <g class="node gender" transform="translate({gender_x},{y})">
+          <rect x="-72" y="-25" width="144" height="50" rx="11"></rect>
+          <text class="label-main" y="-4">Gender</text>
+          <text class="label-sub" y="14">{html.escape(_short_text(gender, 18))}</text>
+        </g>
+        """
+        for gender, y in gender_positions.items()
+    ]
+
+    return f"""
+    <div class="neo4j-graph">
+      <svg viewBox="0 0 980 {height}" role="img" aria-label="Neo4j article relationship graph">
+        <defs>
+          <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+            <feDropShadow dx="0" dy="6" stdDeviation="7" flood-color="#0f172a" flood-opacity="0.14"/>
+          </filter>
+        </defs>
+        <g class="edges">{"".join(edges)}</g>
+        <g class="node query" transform="translate({query_x},{query_y})">
+          <circle r="58"></circle>
+          <text class="label-main" y="-5">Query</text>
+          <text class="label-sub" y="16">{html.escape(_short_text(topic, 14))}</text>
+        </g>
+        {"".join(topic_nodes)}
+        {"".join(article_nodes)}
+        {"".join(gender_nodes)}
+        {"".join(similar_nodes)}
+      </svg>
+    </div>
+    <style>
+      .neo4j-graph {{
+        width: 100%;
+        overflow-x: auto;
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 8px;
+        background: #f8fafc;
+      }}
+      .neo4j-graph svg {{
+        min-width: 920px;
+        display: block;
+      }}
+      .neo4j-graph .edges path {{
+        fill: none;
+        stroke: #94a3b8;
+        stroke-width: 2;
+      }}
+      .neo4j-graph .edges .edge-topic {{ stroke: #38bdf8; }}
+      .neo4j-graph .edges .edge-gender {{ stroke: #f59e0b; }}
+      .neo4j-graph .edges .edge-similar {{ stroke: #a78bfa; stroke-dasharray: 5 5; }}
+      .neo4j-graph .node rect,
+      .neo4j-graph .node circle {{
+        filter: url(#shadow);
+        stroke-width: 2;
+      }}
+      .neo4j-graph .query circle {{ fill: #dbeafe; stroke: #3b82f6; }}
+      .neo4j-graph .topic rect {{ fill: #e0f2fe; stroke: #0284c7; }}
+      .neo4j-graph .article rect {{ fill: #dcfce7; stroke: #22c55e; }}
+      .neo4j-graph .gender rect {{ fill: #fef3c7; stroke: #f59e0b; }}
+      .neo4j-graph .similar rect {{ fill: #ede9fe; stroke: #8b5cf6; }}
+      .neo4j-graph text {{
+        text-anchor: middle;
+        font-family: "Microsoft JhengHei", "Noto Sans TC", Arial, sans-serif;
+        fill: #0f172a;
+      }}
+      .neo4j-graph .label-main {{
+        font-size: 13px;
+        font-weight: 700;
+      }}
+      .neo4j-graph .label-sub {{
+        font-size: 11px;
+      }}
+    </style>
+    """
+
+
+def render_neo4j_results(topic: str, rows: List[Dict[str, object]]) -> None:
+    st.subheader("Neo4j 文章檢索結果")
+    components.html(build_neo4j_graph_html(topic, rows), height=max(400, min(820, 150 + len(rows) * 72)))
+
+    df_neo4j = neo4j_result_table(rows)
+    st.dataframe(
+        df_neo4j,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "url": st.column_config.LinkColumn("url"),
+        },
+    )
+
+
 def main():
     args = parse_args()
 
@@ -376,6 +627,12 @@ def main():
         top_n_each = st.slider("SBERT/BM25 各取前 N 筆", 10, 100, 30, 5)
         final_top_k = st.slider("RRF 最後候選文章數", 3, 20, 10, 1)
         rrf_k = st.slider("RRF k 值", 10, 100, 60, 5)
+        use_neo4j = st.checkbox("啟用 Neo4j 文章檢索擴展", value=False)
+        neo4j_gender = st.selectbox(
+            "Neo4j 性別過濾",
+            ["不過濾", "female", "male"],
+            index=0,
+        )
         use_ag2 = st.checkbox("使用 AG2 產生推薦理由", value=True)
 
     st_c_chat = st.container(border=True)
@@ -411,6 +668,26 @@ def main():
 
         st.subheader("RRF 檢索結果")
         st.dataframe(df_results, use_container_width=True, hide_index=True)
+
+        if use_neo4j:
+            try:
+                with st.spinner("從 Neo4j 查詢相關文章..."):
+                    gender_filter = None if neo4j_gender == "不過濾" else neo4j_gender
+                    neo4j_driver = load_neo4j_driver()
+                    neo4j_results = query_articles_by_topic(
+                        neo4j_driver,
+                        prompt,
+                        limit=final_top_k,
+                        gender=gender_filter,
+                    )
+            except Exception as e:
+                neo4j_results = []
+                st.warning(f"Neo4j 查詢失敗：{e}")
+
+            if neo4j_results:
+                render_neo4j_results(prompt, neo4j_results)
+            else:
+                st.info("Neo4j 尚未找到符合查詢的文章。")
 
         if use_ag2:
             try:

@@ -15,6 +15,15 @@ pip install pandas numpy sentence-transformers jieba rank-bm25 tqdm
 python build_gender_retrieval_index.py \
   --input_csv "dcard_3000_merged_cleaned(3).csv" \
   --output_dir "retrieval_store"
+
+# 若要同時將結果寫入 Neo4j
+python build_gender_retrieval_index.py \
+  --input_csv "dcard_3000_merged_cleaned(3).csv" \
+  --output_dir "retrieval_store" \
+  --neo4j-import \
+  --neo4j-uri "bolt://localhost:7687" \
+  --neo4j-user "neo4j" \
+  --neo4j-password "your_password"
 """
 
 from __future__ import annotations
@@ -29,9 +38,12 @@ from typing import List
 import jieba
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+
+from neo4j_utils import get_neo4j_driver, import_articles_to_neo4j
 
 
 DEFAULT_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -170,6 +182,8 @@ def save_outputs(
 
 
 def main() -> None:
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
     parser = argparse.ArgumentParser(description="Build SBERT + Jieba BM25 retrieval store from gender-labeled Dcard data.")
     parser.add_argument("--input_csv", type=str, required=True, help="輸入 CSV 檔案路徑")
     parser.add_argument("--output_dir", type=str, default="retrieval_store", help="輸出資料夾")
@@ -177,6 +191,10 @@ def main() -> None:
     parser.add_argument("--content_col", type=str, default="article_content", help="文章內容欄位名稱")
     parser.add_argument("--gender_col", type=str, default="gender", help="性別欄位名稱")
     parser.add_argument("--batch_size", type=int, default=32, help="SBERT encode batch size")
+    parser.add_argument("--neo4j-import", action="store_true", help="將訓練後的文章資料匯入 Neo4j")
+    parser.add_argument("--neo4j-uri", type=str, default=None, help="Neo4j 連線 URI，例如 bolt://localhost:7687")
+    parser.add_argument("--neo4j-user", type=str, default=None, help="Neo4j 使用者名稱")
+    parser.add_argument("--neo4j-password", type=str, default=None, help="Neo4j 密碼")
     args = parser.parse_args()
 
     input_csv = Path(args.input_csv)
@@ -221,6 +239,23 @@ def main() -> None:
         content_col=args.content_col,
         gender_col=args.gender_col,
     )
+
+    if args.neo4j_import:
+        print("\n開始將文章匯入 Neo4j...")
+        driver = get_neo4j_driver(
+            uri=args.neo4j_uri,
+            user=args.neo4j_user,
+            password=args.neo4j_password,
+        )
+        import_articles_to_neo4j(
+            driver=driver,
+            df=df,
+            embeddings=embeddings,
+            content_col=args.content_col,
+            gender_col=args.gender_col,
+        )
+        driver.close()
+        print("Neo4j 匯入完成。")
 
     print("\n完成！輸出位置：", output_dir.resolve())
     print("包含：metadata.csv、sbert_embeddings.npy、bm25_index.pkl、jieba_tokenized_corpus.pkl、config.json")
