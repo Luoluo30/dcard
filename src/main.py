@@ -308,7 +308,7 @@ Response language:
 - 標題：
 - 原文網址：
 - 推薦理由：
-...依此類推，直到推薦文章 5。
+...依此類推，如果推薦的篇數不滿5篇則不需要顯示到5篇。
 """.strip()
 
     result = user_proxy.initiate_chat(
