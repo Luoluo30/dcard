@@ -3,8 +3,8 @@
 
 ```bash
 GOOGLE_GEMINI_API_KEY=你的api_key
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
+NEO4J_URI=你的uri
+NEO4J_USERNAME=你的帳號
 NEO4J_PASSWORD=你的密碼
 ```
 
@@ -12,7 +12,6 @@ NEO4J_PASSWORD=你的密碼
 本專案支援使用 pip 來管理依賴。
 
 ```bash
-# 若你使用 requirements.txt
 pip install -r requirements.txt
 ```
 
