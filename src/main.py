@@ -73,8 +73,10 @@ class SearchResult:
     rrf_score: float
     sbert_rank: int | None
     bm25_rank: int | None
+    neo4j_rank: int | None
     sbert_score: float | None
     bm25_score: float | None
+    neo4j_score: float | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -191,19 +193,57 @@ def get_top_rank_map(scores: np.ndarray, top_n: int) -> Dict[int, Tuple[int, flo
         rank_map[int(idx)] = (rank, float(scores[idx]))
     return rank_map
 
+def get_neo4j_rank_map(rows: List[Dict[str, object]], top_n: int) -> Dict[int, Tuple[int, float]]:
+    rank_map: Dict[int, Tuple[int, float]] = {}
+
+    for rank, row in enumerate(rows[:top_n], start=1):
+        doc_id = row.get("doc_id")
+        if doc_id is None:
+            continue
+
+        try:
+            doc_id = int(doc_id)
+        except (TypeError, ValueError):
+            continue
+
+        topics = row.get("topics")
+        topics = topics if isinstance(topics, list) else []
+
+        similar_articles = row.get("similar_articles")
+        similar_articles = similar_articles if isinstance(similar_articles, list) else []
+
+        max_sim_score = 0.0
+        for item in similar_articles:
+            if isinstance(item, dict) and item.get("score") is not None:
+                try:
+                    max_sim_score = max(max_sim_score, float(item.get("score")))
+                except (TypeError, ValueError):
+                    pass
+
+        # score 只是顯示與解釋用，RRF 主要用 rank
+        neo4j_score = len(topics) + max_sim_score
+
+        rank_map[doc_id] = (rank, neo4j_score)
+
+    return rank_map
+
 
 def reciprocal_rank_fusion(
     sbert_rank_map: Dict[int, Tuple[int, float]],
     bm25_rank_map: Dict[int, Tuple[int, float]],
+    neo4j_rank_map: Dict[int, Tuple[int, float]] | None = None,
     rrf_k: int = 60,
     final_top_k: int = 10,
+    neo4j_weight: float = 1.0,
 ) -> List[SearchResult]:
-    candidate_ids = set(sbert_rank_map.keys()) | set(bm25_rank_map.keys())
+    if neo4j_rank_map is None:
+        neo4j_rank_map = {}
+    candidate_ids = set(sbert_rank_map.keys()) | set(bm25_rank_map.keys() | set(neo4j_rank_map.keys()))
     results: List[SearchResult] = []
 
     for doc_id in candidate_ids:
         rrf_score = 0.0
-        sbert_rank = sbert_score = bm25_rank = bm25_score = None
+        sbert_rank = sbert_score = bm25_rank = bm25_score = neo4j_rank = neo4j_score = None
 
         if doc_id in sbert_rank_map:
             sbert_rank, sbert_score = sbert_rank_map[doc_id]
@@ -213,6 +253,10 @@ def reciprocal_rank_fusion(
             bm25_rank, bm25_score = bm25_rank_map[doc_id]
             rrf_score += 1.0 / (rrf_k + bm25_rank)
 
+        if doc_id in neo4j_rank_map:
+            neo4j_rank, neo4j_score = neo4j_rank_map[doc_id]
+            rrf_score += neo4j_weight * (1.0 / (rrf_k + neo4j_rank))
+
         results.append(
             SearchResult(
                 doc_id=doc_id,
@@ -221,6 +265,8 @@ def reciprocal_rank_fusion(
                 bm25_rank=bm25_rank,
                 sbert_score=sbert_score,
                 bm25_score=bm25_score,
+                neo4j_rank=neo4j_rank,
+                neo4j_score=neo4j_score,
             )
         )
 
@@ -232,9 +278,11 @@ def retrieve_articles(
     model: SentenceTransformer,
     embeddings: np.ndarray,
     bm25,
+    neo4j_rank_map: Dict[int, Tuple[int, float]] | None = None,
     top_n_each: int = 30,
     final_top_k: int = 10,
     rrf_k: int = 60,
+    neo4j_weight: float = 1.0,
 ) -> List[SearchResult]:
     query_embedding = model.encode([query], normalize_embeddings=True)
     sbert_scores = cosine_similarity(query_embedding, embeddings)[0]
@@ -249,6 +297,8 @@ def retrieve_articles(
         bm25_rank_map=bm25_rank_map,
         rrf_k=rrf_k,
         final_top_k=final_top_k,
+        neo4j_rank_map=neo4j_rank_map,
+        neo4j_weight=neo4j_weight,
     )
 
 
@@ -271,8 +321,10 @@ def make_candidate_context(metadata: pd.DataFrame, results: List[SearchResult], 
             f"rrf_score: {r.rrf_score:.6f}\n"
             f"sbert_rank: {r.sbert_rank}\n"
             f"bm25_rank: {r.bm25_rank}\n"
+            f"neo4j_rank: {r.neo4j_rank}\n"
             f"sbert_score: {r.sbert_score}\n"
             f"bm25_score: {r.bm25_score}\n"
+            f"neo4j_score: {r.neo4j_score}\n"
             f"content_preview: {preview}\n"
         )
     return "\n---\n".join(blocks)
@@ -333,8 +385,10 @@ def result_table(metadata: pd.DataFrame, results: List[SearchResult], content_co
             "rrf_score": round(r.rrf_score, 6),
             "sbert_rank": r.sbert_rank,
             "bm25_rank": r.bm25_rank,
+            "neo4j_rank": r.neo4j_rank,
             "sbert_score": None if r.sbert_score is None else round(r.sbert_score, 4),
             "bm25_score": None if r.bm25_score is None else round(r.bm25_score, 4),
+            "neo4j_score": None if r.neo4j_score is None else round(r.neo4j_score, 4),
             "content_preview": content[:120],
         })
     return pd.DataFrame(rows)
@@ -624,10 +678,10 @@ def main():
             ],
             index=0,
         )
-        top_n_each = st.slider("SBERT/BM25 各取前 N 筆", 10, 100, 30, 5)
+        top_n_each = st.slider("SBERT/BM25/Neo4j 各取前 N 筆", 10, 100, 30, 5)
         final_top_k = st.slider("RRF 最後候選文章數", 3, 20, 10, 1)
         rrf_k = st.slider("RRF k 值", 10, 100, 60, 5)
-        use_neo4j = st.checkbox("啟用 Neo4j 文章檢索擴展", value=False)
+        use_neo4j = st.checkbox("啟用 Neo4j 文章檢索擴展", value=True)
         neo4j_gender = st.selectbox(
             "Neo4j 性別過濾",
             ["不過濾", "female", "male"],
@@ -654,20 +708,8 @@ def main():
     def chat(prompt: str):
         render_chat_message(st_c_chat, "user", prompt, name="User", avatar=user_image)
 
-        with st.spinner("正在計算 SBERT、BM25 與 RRF..."):
-            results = retrieve_articles(
-                query=prompt,
-                model=model,
-                embeddings=embeddings,
-                bm25=bm25,
-                top_n_each=top_n_each,
-                final_top_k=final_top_k,
-                rrf_k=rrf_k,
-            )
-            df_results = result_table(metadata, results, content_col)
-
-        st.subheader("RRF 檢索結果")
-        st.dataframe(df_results, use_container_width=True, hide_index=True)
+        neo4j_results = []
+        neo4j_rank_map = None
 
         if use_neo4j:
             try:
@@ -677,17 +719,43 @@ def main():
                     neo4j_results = query_articles_by_topic(
                         neo4j_driver,
                         prompt,
-                        limit=final_top_k,
+                        limit=top_n_each,
                         gender=gender_filter,
                     )
+
+                    neo4j_rank_map = get_neo4j_rank_map(
+                        rows=neo4j_results,
+                        top_n=top_n_each,
+                    )
+
             except Exception as e:
                 neo4j_results = []
+                neo4j_rank_map = None
                 st.warning(f"Neo4j 查詢失敗：{e}")
 
             if neo4j_results:
                 render_neo4j_results(prompt, neo4j_results)
             else:
                 st.info("Neo4j 尚未找到符合查詢的文章。")
+
+        with st.spinner("正在計算 SBERT、BM25 與 RRF..."):
+            results = retrieve_articles(
+                query=prompt,
+                model=model,
+                embeddings=embeddings,
+                bm25=bm25,
+                neo4j_rank_map=neo4j_rank_map,
+                top_n_each=top_n_each,
+                final_top_k=final_top_k,
+                rrf_k=rrf_k,
+                neo4j_weight=1.0,
+            )
+            df_results = result_table(metadata, results, content_col)
+
+        st.subheader("RRF 檢索結果")
+        st.dataframe(df_results, use_container_width=True, hide_index=True)
+
+        
 
         if use_ag2:
             try:
