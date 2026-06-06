@@ -5,10 +5,12 @@ pages/chatbot.py  ── Dcard 語氣串接 AI 聊天機器人
 - 移除雙層 @st.cache_resource 包裝（原因是 [Errno 22]）
 - 直接呼叫 main.py 已快取的 load_store / load_sbert_model
 - 無 API Key 時顯示明確提示
+- 支援自動語言偵測（打英文回英文、打中文回中文）+ 手動切換
 """
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from typing import List
@@ -82,6 +84,12 @@ with st.sidebar:
         ["gemini-2.5-flash", "gemini-2.5-flash-lite"],
         index=0,
     )
+    lang_mode = st.radio(
+        "回應語言",
+        ["🔍 自動偵測（依輸入語言）", "🇹🇼 繁體中文", "🇺🇸 English"],
+        index=0,
+        help="自動偵測：打中文就回中文，打英文就回英文",
+    )
     top_n_each = st.slider("SBERT/BM25 各取前 N 筆", 5, 50, 15, 5)
     final_top_k = st.slider("RRF 候選篇數", 3, 10, 5, 1)
     rrf_k       = st.slider("RRF k 值", 10, 100, 60, 5)
@@ -125,6 +133,26 @@ for k, v in [("chat_history", []), ("tone_profile", None),
 
 # ── 工具函式 ─────────────────────────────────────────────────────────────
 
+def _detect_lang(text: str) -> str:
+    """
+    簡易語言偵測：計算中文字比例。
+    > 15% 中文字 → 'zh'（繁中回應）
+    否則          → 'en'（英文回應）
+    """
+    chinese_chars = len(re.findall(r'[一-鿿㐀-䶿]', text))
+    ratio = chinese_chars / max(len(text.strip()), 1)
+    return "zh" if ratio > 0.15 else "en"
+
+
+def _resolve_lang(user_msg: str) -> str:
+    """依 lang_mode 側邊欄設定決定本輪回應語言。"""
+    if "English" in lang_mode:
+        return "en"
+    if "繁體中文" in lang_mode:
+        return "zh"
+    return _detect_lang(user_msg)   # 自動偵測
+
+
 def _build_articles_text(results, max_chars: int = 700) -> str:
     parts = []
     for i, r in enumerate(results, 1):
@@ -157,6 +185,19 @@ def chat_with_tone(history: List[dict], user_msg: str) -> str:
     from google.genai import types  # noqa: PLC0415
     client = _get_gemini_client()
 
+    lang = _resolve_lang(user_msg)
+    if lang == "en":
+        lang_instruction = (
+            "IMPORTANT: The user is writing in English. "
+            "You MUST respond entirely in English. "
+            "Keep the same emotional tone and writing style as described above, "
+            "but express it naturally in English."
+        )
+    else:
+        lang_instruction = (
+            "請用繁體中文回應，語氣自然，保持上述語氣特徵。"
+        )
+
     system_instruction = (
         "你是一個能深度模仿語氣的聊天夥伴。\n\n"
         "【語氣特徵（從 Dcard 文章分析而來）】\n"
@@ -164,7 +205,8 @@ def chat_with_tone(history: List[dict], user_msg: str) -> str:
         "【語氣來源文章節錄】\n"
         f"{st.session_state['articles_text'][:1800]}\n\n"
         "嚴格依照上述語氣特徵與使用者對話，就像你是那些文章的作者。\n"
-        "用繁體中文回應，語氣自然，不要提及「語氣」、「文章」、「Dcard」等字眼。"
+        "不要提及「語氣」、「文章」、「Dcard」等字眼。\n\n"
+        f"【語言規則】\n{lang_instruction}"
     )
 
     contents = [
