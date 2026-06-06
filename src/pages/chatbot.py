@@ -157,20 +157,30 @@ def _translate_to_zh(text: str) -> str:
     """
     若輸入為英文，用 Gemini 翻譯成繁體中文後回傳，
     供 Jieba / BM25 使用；已是中文則直接回傳原文。
+    使用 thinking_budget=0 避免思考過程混入回應。
     """
     if _detect_lang(text) == "zh":
         return text
+    from google.genai import types as _t
     client = _get_gemini_client()
     prompt = (
         "請將以下關鍵字或句子翻譯成繁體中文，"
         "只輸出翻譯結果，不需要任何說明或標點補充：\n"
         f"{text}"
     )
-    resp = client.models.generate_content(model=gemini_model, contents=prompt)
+    resp = client.models.generate_content(
+        model=gemini_model,
+        contents=prompt,
+        config=_t.GenerateContentConfig(
+            temperature=0,
+            thinking_config=_t.ThinkingConfig(thinking_budget=0),  # 關閉思考，避免輸出雜訊
+        ),
+    )
     return resp.text.strip()
 
 
-def _build_articles_text(results, max_chars: int = 700) -> str:
+def _build_articles_text(results, max_chars: int = 1200) -> str:
+    """每篇文章取更多原文（1200字），讓語氣分析有足夠素材。"""
     parts = []
     for i, r in enumerate(results, 1):
         row = metadata.iloc[r.doc_id]
@@ -180,50 +190,74 @@ def _build_articles_text(results, max_chars: int = 700) -> str:
     return "\n\n".join(parts)
 
 
-def extract_tone_profile(articles_text: str) -> str:
-    from google.genai import types  # noqa: PLC0415
+def extract_tone_profile(articles_text: str, topic: str = "") -> str:
+    """
+    從原文萃取具體、可操作的語氣特徵（顯示給使用者看）：
+    - 標誌性句型（引用原句）
+    - 核心情緒與語氣
+    - 仿寫示範（few-shot 錨點）
+    口頭禪與禁止詞由 system prompt 內部處理，不對外顯示。
+    """
     client = _get_gemini_client()
+    topic_hint = f"（主題：{topic}）" if topic else ""
     prompt = (
-        "以下是從 Dcard 平台蒐集的文章內容：\n\n"
+        f"以下是從 Dcard 平台蒐集{topic_hint}的文章原文：\n\n"
         f"{articles_text}\n\n"
-        "請仔細分析這些文章共同的語氣特色，用繁體中文描述：\n"
-        "1. 整體語感（輕鬆閒聊 / 情緒宣洩 / 認真訴說 / 幽默調侃…）\n"
-        "2. 用詞傾向（口語化程度、常見用語）\n"
-        "3. 情感表達（直白 / 婉轉、情緒濃度）\n"
-        "4. 常用語助詞或語氣詞\n"
-        "5. 句子節奏（長短句偏好）\n\n"
-        "只輸出語氣描述段落，不需標題或編號。"
+        f"請深度分析上述文章中與「{topic or '此主題'}」情緒直接相關的語氣，"
+        "必須從原文找具體依據，用繁體中文輸出以下三點：\n\n"
+        "1.【標誌性句型】從原文中找出 4-5 個**能直接反映主題情緒**的句子（盡量直接引用原文）。"
+        "⚠️ 嚴格過濾：身高體重、外貌描述、自我介紹條件、找對象條件等與情緒無關的內容一律不引用。\n\n"
+        "2.【核心情緒與語氣】用 2 句話說明：①這些人說話時情緒有多濃、節奏快還是慢；"
+        "②他們習慣用什麼方式表達這個情緒（自嘲？傾訴？幽默帶過？）。"
+        "禁止出現「口語化」「自然」「真誠」「展現」「營造」這類空洞詞。\n\n"
+        "3.【仿寫示範】假設有人傳訊息說「你最近怎樣」，寫出 3 種這批文章作者會回覆的方式，"
+        f"回覆要明顯帶有「{topic or '此主題'}」的情緒底色，像真人在手機傳訊息，1-3 句，不要像 AI 在寫作文。\n\n"
+        "只輸出上述三點，格式清晰即可。"
     )
-    resp = client.models.generate_content(model=gemini_model, contents=prompt)
+    from google.genai import types as _types
+    resp = client.models.generate_content(
+        model=gemini_model,
+        contents=prompt,
+        config=_types.GenerateContentConfig(temperature=0.3),  # 低隨機性，結果較穩定
+    )
     return resp.text.strip()
 
 
-def chat_with_tone(history: List[dict], user_msg: str) -> str:
+def chat_with_tone(history: List[dict], user_msg: str):
+    """回傳文字串流 generator，供 st.write_stream() 使用。"""
     from google.genai import types  # noqa: PLC0415
     client = _get_gemini_client()
 
     lang = _resolve_lang(user_msg)
     if lang == "en":
         lang_instruction = (
-            "IMPORTANT: The user is writing in English. "
-            "You MUST respond entirely in English. "
-            "Keep the same emotional tone and writing style as described above, "
-            "but express it naturally in English."
+            "IMPORTANT: The user typed in English — respond entirely in English. "
+            "Mirror the same raw emotional tone from the articles but in English. "
+            "Keep it short, casual, like texting a friend. No AI-speak."
         )
     else:
-        lang_instruction = (
-            "請用繁體中文回應，語氣自然，保持上述語氣特徵。"
-        )
+        lang_instruction = "用繁體中文回覆，像在傳訊息，不要像 AI 在寫文章。"
+
+    raw_excerpt = st.session_state["articles_text"][:4000]
+    current_topic = st.session_state.get("current_topic", "").split("（")[0].strip()
 
     system_instruction = (
-        "你是一個能深度模仿語氣的聊天夥伴。\n\n"
-        "【語氣特徵（從 Dcard 文章分析而來）】\n"
+        "━━ 你的身份 ━━\n"
+        "你是一個正在和朋友聊天的真實人類。"
+        f"你不是在「扮演一個{current_topic}的人」，也不是在模擬情境——"
+        f"你只是一個說話語氣、節奏、用詞天生帶有「{current_topic}」色彩的朋友。"
+        "對方說什麼，你就正常回應什麼，只是你的語氣骨子裡自然帶著這個調性。\n\n"
+        "━━ 語氣原始素材（直接從這裡學習句型與措辭）━━\n"
+        f"{raw_excerpt}\n\n"
+        "━━ 語氣分析（具體特徵，必須遵守）━━\n"
         f"{st.session_state['tone_profile']}\n\n"
-        "【語氣來源文章節錄】\n"
-        f"{st.session_state['articles_text'][:1800]}\n\n"
-        "嚴格依照上述語氣特徵與使用者對話，就像你是那些文章的作者。\n"
-        "不要提及「語氣」、「文章」、「Dcard」等字眼。\n\n"
-        f"【語言規則】\n{lang_instruction}"
+        "━━ 絕對禁止 ━━\n"
+        "• AI 腔一律禁止：當然、確實、非常好、值得注意、當然可以、沒問題、很棒、絕對、必須承認\n"
+        "• 禁止條列（不用 1. 2. 3. 或 •）\n"
+        "• 每次回覆 1-4 句，像在手機傳訊息，不要寫作文\n"
+        "• 要有情緒，不要像客服\n"
+        "• 不提「語氣」「文章」「Dcard」「分析」\n\n"
+        f"━━ 語言 ━━\n{lang_instruction}"
     )
 
     contents = [
@@ -232,15 +266,21 @@ def chat_with_tone(history: List[dict], user_msg: str) -> str:
     ]
     contents.append(types.Content(role="user", parts=[types.Part(text=user_msg)]))
 
-    resp = client.models.generate_content(
+    stream = client.models.generate_content_stream(
         model=gemini_model,
         contents=contents,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
-            temperature=0.85,
+            temperature=1.0,
         ),
     )
-    return resp.text.strip()
+
+    def _gen():
+        for chunk in stream:
+            if chunk.text:
+                yield chunk.text
+
+    return _gen()
 
 
 # ── 主介面 ───────────────────────────────────────────────────────────────
@@ -274,7 +314,7 @@ if st.session_state["tone_profile"] is None:
                 rrf_k=rrf_k,
             )
             articles_text  = _build_articles_text(results)
-            tone_profile   = extract_tone_profile(articles_text)
+            tone_profile   = extract_tone_profile(articles_text, topic=topic_zh)
             source_articles = [
                 {
                     "title":   metadata.iloc[r.doc_id].get("article_title", ""),
@@ -320,13 +360,22 @@ else:
 
     if user_input:
         st.session_state["chat_history"].append({"role": "user", "content": user_input})
-        with st.spinner("AI 思考中…"):
-            try:
-                reply = chat_with_tone(
-                    history=st.session_state["chat_history"][:-1],
-                    user_msg=user_input,
-                )
-            except Exception as exc:
-                reply = f"⚠️ 發生錯誤：{exc}"
+
+        # 直接在 chat_box 裡串流顯示，不用 spinner
+        with chat_box:
+            with st.chat_message("user", avatar="👤"):
+                st.markdown(user_input)
+            with st.chat_message("model", avatar="🤖"):
+                try:
+                    reply = st.write_stream(
+                        chat_with_tone(
+                            history=st.session_state["chat_history"][:-1],
+                            user_msg=user_input,
+                        )
+                    )
+                except Exception as exc:
+                    reply = f"⚠️ 發生錯誤：{exc}"
+                    st.markdown(reply)
+
         st.session_state["chat_history"].append({"role": "model", "content": reply})
         st.rerun()
