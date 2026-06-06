@@ -153,6 +153,23 @@ def _resolve_lang(user_msg: str) -> str:
     return _detect_lang(user_msg)   # 自動偵測
 
 
+def _translate_to_zh(text: str) -> str:
+    """
+    若輸入為英文，用 Gemini 翻譯成繁體中文後回傳，
+    供 Jieba / BM25 使用；已是中文則直接回傳原文。
+    """
+    if _detect_lang(text) == "zh":
+        return text
+    client = _get_gemini_client()
+    prompt = (
+        "請將以下關鍵字或句子翻譯成繁體中文，"
+        "只輸出翻譯結果，不需要任何說明或標點補充：\n"
+        f"{text}"
+    )
+    resp = client.models.generate_content(model=gemini_model, contents=prompt)
+    return resp.text.strip()
+
+
 def _build_articles_text(results, max_chars: int = 700) -> str:
     parts = []
     for i, r in enumerate(results, 1):
@@ -242,8 +259,13 @@ if st.session_state["tone_profile"] is None:
 
     if submitted and topic.strip():
         with st.spinner(f"正在從 Dcard 文章分析「{topic}」的語氣…"):
+            # ── 英文→繁中翻譯，讓 Jieba/BM25 能正確分詞 ──────────────
+            topic_zh = _translate_to_zh(topic.strip())
+            if topic_zh != topic.strip():
+                st.info(f"🔄 已將「{topic}」翻譯為「{topic_zh}」進行搜尋")
+
             results = retrieve_articles(
-                query=topic,
+                query=topic_zh,
                 model=sbert_model,
                 embeddings=embeddings,
                 bm25=bm25,
@@ -265,7 +287,7 @@ if st.session_state["tone_profile"] is None:
             ]
 
         st.session_state.update({
-            "current_topic":   topic,
+            "current_topic":   f"{topic}（{topic_zh}）" if topic_zh != topic.strip() else topic,
             "tone_profile":    tone_profile,
             "source_articles": source_articles,
             "articles_text":   articles_text,
